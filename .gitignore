@@ -1,0 +1,19 @@
+# --- PlatformIO ---
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- Secrets (Phase 6+: Wi-Fi credentials, API keys) ---
+# Never commit credentials. Real values go in an ignored local file.
+secrets.h
+config.local.h
+*.local.h
+
+# --- Logged data (tools/serial_logger.py output) ---
+tools/*.jsonl
