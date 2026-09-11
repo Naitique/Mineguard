@@ -38,12 +38,20 @@
 #if ENABLE_SYNTHETIC_DATA
 #include "SyntheticData.h"
 #endif
+#if ENABLE_WIFI_FORWARD
+#include <WiFi.h>
+#include "WiFiForwarder.h"
+#include "secrets.h"  // WIFI_SSID / WIFI_PASSWORD -- copy secrets.h.example
+#endif
 
 #if !I2C_ENABLED && !ENABLE_LORA
 #error "Enable at least one feature in config.h (ENABLE_MPU6050 / ENABLE_VL53L1X / ENABLE_LORA)"
 #endif
 #if ENABLE_SYNTHETIC_DATA && !ENABLE_LORA
 #error "ENABLE_SYNTHETIC_DATA needs ENABLE_LORA -- it only feeds the LoRa sender"
+#endif
+#if ENABLE_WIFI_FORWARD && !ENABLE_LORA
+#error "ENABLE_WIFI_FORWARD needs ENABLE_LORA -- it only forwards packets the LoRa receiver gets"
 #endif
 
 // --- Subsystem instances + their init status ------------------------------
@@ -61,6 +69,10 @@ static bool g_lora_ok = false;
 #endif
 #if ENABLE_SYNTHETIC_DATA
 static SyntheticData g_synth;
+#endif
+#if ENABLE_WIFI_FORWARD
+static WiFiForwarder g_wifi;
+static bool g_wifi_ok = false;
 #endif
 
 #if I2C_ENABLED
@@ -207,6 +219,26 @@ static void serviceLoRa() {
       Serial.printf("[LoRa] RX rssi=%ddBm snr=%.1fdB len=%u: \"%s\"\n",
                     pkt.rssi_dbm, pkt.snr_db, pkt.payload.length(),
                     pkt.payload.c_str());
+
+#if ENABLE_WIFI_FORWARD
+      if (g_wifi_ok) {
+        String escaped_payload = pkt.payload;
+        escaped_payload.replace("\"", "\\\"");
+        char json[320];
+        snprintf(json, sizeof(json),
+                 "{\"rssi_dbm\":%d,\"snr_db\":%.1f,\"len\":%u,\"payload\":\"%s\"}",
+                 pkt.rssi_dbm, pkt.snr_db, pkt.payload.length(),
+                 escaped_payload.c_str());
+        if (!g_wifi.send(WIFI_FORWARD_HOST, WIFI_FORWARD_PORT,
+                         WIFI_FORWARD_PATH, String(json))) {
+          Serial.println(
+              "[ERROR] WiFi forward failed -- listener unreachable? "
+              "Packet above was still received and printed, just not "
+              "forwarded. Check wifi_listener.py is running and "
+              "WIFI_FORWARD_HOST/PORT in config.h.");
+        }
+      }
+#endif
     }
   }
 }
@@ -312,6 +344,22 @@ void setup() {
         "[LoRa] TX payload source: SYNTHETIC -- fabricated data tagged "
         "\"synth=1\", NOT real measurements. Disable ENABLE_SYNTHETIC_DATA "
         "in config.h once real sensors feed the packet.");
+  }
+#endif
+
+#if ENABLE_WIFI_FORWARD
+  Serial.printf("[WiFi] Connecting to \"%s\"...\n", WIFI_SSID);
+  g_wifi_ok = g_wifi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT_MS);
+  if (g_wifi_ok) {
+    Serial.printf("[WiFi] Connected. IP=%s  forwarding RX packets to %s:%u%s\n",
+                  WiFi.localIP().toString().c_str(), WIFI_FORWARD_HOST,
+                  WIFI_FORWARD_PORT, WIFI_FORWARD_PATH);
+  } else {
+    Serial.println(
+        "[ERROR] WiFi connect failed -- check WIFI_SSID/WIFI_PASSWORD in "
+        "secrets.h, and that the network is 2.4GHz (the ESP32 can't join "
+        "5GHz-only networks). Packets will still print to Serial but won't "
+        "be forwarded.");
   }
 #endif
 #endif  // ENABLE_LORA

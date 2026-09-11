@@ -132,3 +132,26 @@ static const uint32_t LORA_TX_INTERVAL_MS = 2000;
 // carries "synth=1"; nothing downstream may treat it as a real measurement.
 // Requires ENABLE_LORA. Set back to 0 once real sensor data feeds the packet.
 #define ENABLE_SYNTHETIC_DATA 1
+
+// ---------------------------------------------------------------------------
+// Wi-Fi forwarding (RECEIVER board only)
+// ---------------------------------------------------------------------------
+// Separate from the LoRa link above: this pushes each packet the RECEIVER
+// picks up over LoRa onward to a listener (tools/wifi_listener.py) on an
+// analysis laptop, over the local Wi-Fi network. The SENDER board doesn't
+// need this enabled.
+//
+// Requires firmware/src/secrets.h with WIFI_SSID / WIFI_PASSWORD -- copy
+// secrets.h.example and fill in your real network. secrets.h is git-ignored;
+// never commit real credentials.
+#define ENABLE_WIFI_FORWARD 0
+
+// LAN IP (or hostname) and port of the laptop running wifi_listener.py.
+// Find the laptop's IP with `ipconfig getifaddr en0` (macOS Wi-Fi),
+// `hostname -I` (Linux), or `ipconfig` (Windows).
+static const char* const WIFI_FORWARD_HOST = "192.168.1.100";
+static const uint16_t    WIFI_FORWARD_PORT = 8000;
+static const char* const WIFI_FORWARD_PATH = "/";
+
+// How long to wait for the Wi-Fi connection at boot before giving up.
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
