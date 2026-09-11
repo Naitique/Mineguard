@@ -20,7 +20,7 @@
 // ---------------------------------------------------------------------------
 // Change this per physical node: "NODE_01", "NODE_02", ...
 // Nothing else in the codebase should hard-code a node name.
-#define NODE_ID "NODE_02"
+#define NODE_ID "NODE_01"
 
 // Firmware phase label, printed at boot so we can tell units apart on the
 // bench. Purely cosmetic -- update it as the enabled feature set changes.
@@ -100,7 +100,7 @@ static const uint32_t SENSOR_INTERVAL_MS = 1000;
 //   true  -> transmit a test packet every LORA_TX_INTERVAL_MS
 //   false -> listen continuously and print every packet received
 // Flash one board true and another false to test a real link.
-static const bool LORA_ROLE_SENDER = false;
+static const bool LORA_ROLE_SENDER = true;
 
 // SPI + control pins. GPIO numbers; board silkscreen label in the comment.
 // SCK/MISO/MOSI/NSS are the ESP32 VSPI defaults, wired to match.
