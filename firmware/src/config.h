@@ -20,7 +20,7 @@
 // ---------------------------------------------------------------------------
 // Change this per physical node: "NODE_01", "NODE_02", ...
 // Nothing else in the codebase should hard-code a node name.
-#define NODE_ID "NODE_01"
+#define NODE_ID "NODE_02"
 
 // Firmware phase label, printed at boot so we can tell units apart on the
 // bench. Purely cosmetic -- update it as the enabled feature set changes.
@@ -100,7 +100,7 @@ static const uint32_t SENSOR_INTERVAL_MS = 1000;
 //   true  -> transmit a test packet every LORA_TX_INTERVAL_MS
 //   false -> listen continuously and print every packet received
 // Flash one board true and another false to test a real link.
-static const bool LORA_ROLE_SENDER = true;
+static const bool LORA_ROLE_SENDER = false;
 
 // SPI + control pins. GPIO numbers; board silkscreen label in the comment.
 // SCK/MISO/MOSI/NSS are the ESP32 VSPI defaults, wired to match.
@@ -144,12 +144,12 @@ static const uint32_t LORA_TX_INTERVAL_MS = 2000;
 // Requires firmware/src/secrets.h with WIFI_SSID / WIFI_PASSWORD -- copy
 // secrets.h.example and fill in your real network. secrets.h is git-ignored;
 // never commit real credentials.
-#define ENABLE_WIFI_FORWARD 0
+#define ENABLE_WIFI_FORWARD 1
 
 // LAN IP (or hostname) and port of the laptop running wifi_listener.py.
 // Find the laptop's IP with `ipconfig getifaddr en0` (macOS Wi-Fi),
 // `hostname -I` (Linux), or `ipconfig` (Windows).
-static const char* const WIFI_FORWARD_HOST = "192.168.1.100";
+static const char* const WIFI_FORWARD_HOST = "10.59.194.146";
 static const uint16_t    WIFI_FORWARD_PORT = 8000;
 static const char* const WIFI_FORWARD_PATH = "/";
 
