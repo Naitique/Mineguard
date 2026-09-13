@@ -1,27 +1,32 @@
 // ===========================================================================
 // main.cpp  --  Mineguard sensor node firmware.
 //
-// Flow:   ESP32  ->  I2C  ->  { MPU6050 (tilt/motion) , VL53L1X (distance) }
-//                ->  SPI  ->  LoRa Ra-02  (node <-> node radio link)
+// Flow:   ESP32  ->  I2C     ->  MPU6050 (tilt/motion)
+//                ->  UART2   ->  GPS (NEO-6M/M8N style, location)
+//                ->  analog/digital -> MQ-2 (methane/smoke, uncalibrated)
+//                ->  1-Wire  ->  DS18B20 (temperature)
+//                ->  SPI     ->  LoRa Ra-02  (node <-> node radio link)
 //                ->  Serial Monitor
 //
 // This file is an ORCHESTRATOR only. Each subsystem's detail lives in its own
 // module under lib/. All tunable settings live in src/config.h.
 //
-// Active features are chosen by ENABLE_MPU6050 / ENABLE_VL53L1X / ENABLE_LORA
-// in config.h:
-//   Phase 1  MPU6050 only
-//   Phase 2  VL53L1X only
-//   Phase 3  both sensors together
-//   Phase 8  LoRa link (sensors optional)   <-- current
+// Active features are chosen by ENABLE_MPU6050 / ENABLE_GPS / ENABLE_MQ2 /
+// ENABLE_DS18B20 / ENABLE_LORA in config.h. Each bus is independent -- bring
+// up any subset. (The VL53L1X / ToF sensor was removed from the project.)
 // ===========================================================================
 #include <Arduino.h>
 
 #include "config.h"
 
-// True when at least one I2C sensor is compiled in. I2C is only initialised
-// and diagnosed when this holds; LoRa is on SPI and fully independent.
-#define I2C_ENABLED (ENABLE_MPU6050 || ENABLE_VL53L1X)
+// True when the I2C sensor is compiled in. I2C is only initialised and
+// diagnosed when this holds.
+#define I2C_ENABLED (ENABLE_MPU6050)
+
+// True when ANY sensor (of any bus) is compiled in -- gates the shared
+// sample-interval scheduler and "[DATA]" block in loop(). LoRa is reported
+// separately (its own timing, its own [LoRa] lines).
+#define SENSORS_ENABLED (ENABLE_MPU6050 || ENABLE_GPS || ENABLE_MQ2 || ENABLE_DS18B20)
 
 #if I2C_ENABLED
 #include <Wire.h>
@@ -29,8 +34,14 @@
 #if ENABLE_MPU6050
 #include "MPU6050Sensor.h"
 #endif
-#if ENABLE_VL53L1X
-#include "VL53L1XSensor.h"
+#if ENABLE_GPS
+#include "GPSModule.h"
+#endif
+#if ENABLE_MQ2
+#include "MQ2Sensor.h"
+#endif
+#if ENABLE_DS18B20
+#include "DS18B20Sensor.h"
 #endif
 #if ENABLE_LORA
 #include "LoRaTransport.h"
@@ -44,8 +55,8 @@
 #include "secrets.h"  // WIFI_SSID / WIFI_PASSWORD -- copy secrets.h.example
 #endif
 
-#if !I2C_ENABLED && !ENABLE_LORA
-#error "Enable at least one feature in config.h (ENABLE_MPU6050 / ENABLE_VL53L1X / ENABLE_LORA)"
+#if !SENSORS_ENABLED && !ENABLE_LORA
+#error "Enable at least one feature in config.h (ENABLE_MPU6050 / ENABLE_GPS / ENABLE_MQ2 / ENABLE_DS18B20 / ENABLE_LORA)"
 #endif
 #if ENABLE_SYNTHETIC_DATA && !ENABLE_LORA
 #error "ENABLE_SYNTHETIC_DATA needs ENABLE_LORA -- it only feeds the LoRa sender"
@@ -59,14 +70,35 @@
 static MPU6050Sensor g_mpu;
 static bool g_mpu_ok = false;
 #endif
-#if ENABLE_VL53L1X
-static VL53L1XSensor g_tof;
-static bool g_tof_ok = false;
+#if ENABLE_GPS
+static GPSModule g_gps;
+static bool g_gps_ok = false;
+#endif
+#if ENABLE_MQ2
+static MQ2Sensor g_mq2;
+#endif
+#if ENABLE_DS18B20
+static DS18B20Sensor g_ds18b20;
+static bool g_ds18b20_ok = false;
 #endif
 #if ENABLE_LORA
 static LoRaTransport g_lora;
 static bool g_lora_ok = false;
+
+// Latest reading from each enabled sensor, cached here so the LoRa sender
+// (its own 2s timing) can build a packet from whatever the 1s sample loop
+// last measured, without re-reading the hardware itself.
+#if ENABLE_MPU6050
+static MpuReading g_last_mpu;
+static bool g_last_mpu_valid = false;
 #endif
+#if ENABLE_GPS
+static GpsReading g_last_gps;
+#endif
+#if ENABLE_MQ2
+static Mq2Reading g_last_mq2;
+#endif
+#endif  // ENABLE_LORA
 #if ENABLE_SYNTHETIC_DATA
 static SyntheticData g_synth;
 #endif
@@ -75,7 +107,7 @@ static WiFiForwarder g_wifi;
 static bool g_wifi_ok = false;
 #endif
 
-#if I2C_ENABLED
+#if SENSORS_ENABLED
 // millis() timestamp of the last sensor sample (non-blocking scheduler).
 static uint32_t g_last_sample_ms = 0;
 #endif
@@ -136,8 +168,8 @@ static void diagnoseEmptyBus() {
         "jumpers; then try without the breadboard.");
   } else {
     Serial.println(
-        "[I2C]   A device responded. Expected: MPU6050 at 0x68/0x69, "
-        "VL53L1X at 0x29. Set the matching address in config.h.");
+        "[I2C]   A device responded. Expected: MPU6050 at 0x68/0x69. "
+        "Set the matching address in config.h.");
   }
 }
 #endif  // I2C_ENABLED
@@ -153,13 +185,6 @@ static void printMpu(const MpuReading& r) {
 }
 #endif
 
-#if ENABLE_VL53L1X
-static void printTof(const TofReading& r) {
-  Serial.printf("[VL53L1X] distance=%umm  status=%u (%s)\n",
-                r.distance_mm, r.range_status, r.status_text);
-}
-#endif
-
 // ===========================================================================
 // LoRa service (compiled only when ENABLE_LORA)
 // ===========================================================================
@@ -172,16 +197,54 @@ static void printTof(const TofReading& r) {
 // set stays in SyntheticReading for when real sensors replace this.
 static String formatSyntheticPayload(uint32_t seq, uint32_t now_ms,
                                      const SyntheticReading& s) {
-  char buf[128];
+  char buf[96];
   snprintf(buf, sizeof(buf),
            "node=%s seq=%lu up=%.1f synth=1 roll=%.2f pitch=%.2f "
-           "az=%.2f gz=%.1f dist_mm=%u rstat=%u",
+           "az=%.2f gz=%.1f",
            NODE_ID, (unsigned long)seq, now_ms / 1000.0f,
-           s.roll_deg, s.pitch_deg, s.accel_z_g, s.gyro_z_dps,
-           s.dist_mm, s.range_status);
+           s.roll_deg, s.pitch_deg, s.accel_z_g, s.gyro_z_dps);
   return String(buf);
 }
 #endif  // ENABLE_SYNTHETIC_DATA
+
+#if !ENABLE_SYNTHETIC_DATA
+// Pack the latest REAL sensor readings into a compact key=value line. Each
+// section only appears if that sensor is enabled and has produced at least
+// one valid reading -- a sensor that's down just leaves its fields out
+// rather than sending stale or fabricated numbers.
+static String formatRealPayload(uint32_t seq, uint32_t now_ms) {
+  char buf[200];
+  int n = snprintf(buf, sizeof(buf), "node=%s seq=%lu up=%.1f",
+                   NODE_ID, (unsigned long)seq, now_ms / 1000.0f);
+
+#if ENABLE_MPU6050
+  if (g_last_mpu_valid && n > 0 && (size_t)n < sizeof(buf)) {
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  " roll=%.2f pitch=%.2f az=%.2f gz=%.1f",
+                  g_last_mpu.roll_deg, g_last_mpu.pitch_deg,
+                  g_last_mpu.accel_z_g, g_last_mpu.gyro_z_dps);
+  }
+#endif
+#if ENABLE_GPS
+  if (n > 0 && (size_t)n < sizeof(buf)) {
+    n += snprintf(buf + n, sizeof(buf) - n, " fix=%d",
+                  g_last_gps.has_fix ? 1 : 0);
+  }
+  if (g_last_gps.has_fix && n > 0 && (size_t)n < sizeof(buf)) {
+    n += snprintf(buf + n, sizeof(buf) - n, " lat=%.6f lon=%.6f",
+                  g_last_gps.latitude_deg, g_last_gps.longitude_deg);
+  }
+#endif
+#if ENABLE_MQ2
+  if (n > 0 && (size_t)n < sizeof(buf)) {
+    n += snprintf(buf + n, sizeof(buf) - n, " mq2=%u mq2d=%d",
+                  g_last_mq2.analog_raw, g_last_mq2.digital_pin_high ? 1 : 0);
+  }
+#endif
+
+  return String(buf);
+}
+#endif  // !ENABLE_SYNTHETIC_DATA
 
 // Sender: transmit a short structured test line every LORA_TX_INTERVAL_MS.
 // Receiver: drain any frames that have arrived and print them with RSSI/SNR.
@@ -206,8 +269,7 @@ static void serviceLoRa() {
     g_synth.read(s);
     String msg = formatSyntheticPayload(seq, now, s);
 #else
-    String msg = String("node=") + NODE_ID + " seq=" + String(seq) +
-                 " uptime_s=" + String(now / 1000.0f, 1);
+    String msg = formatRealPayload(seq, now);
 #endif
     const bool ok = g_lora.send(msg);
     Serial.printf("[LoRa] TX seq=%lu (%s): \"%s\"\n",
@@ -271,8 +333,22 @@ void setup() {
 #if ENABLE_MPU6050
   g_mpu_ok = g_mpu.begin(Wire, MPU6050_I2C_ADDR);
   if (g_mpu_ok) {
-    Serial.printf("[MPU6050] Detected at 0x%02X\n", MPU6050_I2C_ADDR);
+    const uint8_t chip = g_mpu.chipId();
+    const char* chip_name = (chip == MPU_WHOAMI_MPU6050)   ? "MPU6050"
+                             : (chip == MPU_WHOAMI_MPU6500) ? "MPU6500 (GY-521 clone)"
+                                                             : "unknown";
+    Serial.printf("[MPU6050] Detected at 0x%02X  chip=%s (WHO_AM_I=0x%02X)\n",
+                  MPU6050_I2C_ADDR, chip_name, chip);
     any_sensor_ok = true;
+  } else if (g_mpu.chipId() != 0) {
+    // Something answered the address but wasn't a recognised chip ID -- see
+    // MPU_WHOAMI_* in MPU6050Sensor.h for the accepted list.
+    Serial.printf(
+        "[ERROR] MPU6050 not recognised: a chip answered at 0x%02X but its "
+        "WHO_AM_I=0x%02X isn't a known MPU6050/MPU6500 value. Either a "
+        "different clone chip, or a noisy read -- try I2C_CLOCK_HZ = 100000 "
+        "in config.h.\n",
+        MPU6050_I2C_ADDR, g_mpu.chipId());
   } else {
     Serial.printf(
         "[ERROR] MPU6050 not detected at 0x%02X -- check wiring "
@@ -282,34 +358,59 @@ void setup() {
   }
 #endif
 
-#if ENABLE_VL53L1X
-  g_tof_ok = g_tof.begin(Wire, VL53L1X_LONG_RANGE, VL53L1X_TIMING_BUDGET_US,
-                         VL53L1X_INTERMEASUREMENT_MS, VL53L1X_IO_TIMEOUT_MS);
-  if (g_tof_ok) {
-    Serial.printf("[VL53L1X] Detected at 0x%02X (%s range)\n",
-                  VL53L1X_I2C_ADDR, VL53L1X_LONG_RANGE ? "long" : "short");
-    any_sensor_ok = true;
-  } else {
-    Serial.printf(
-        "[ERROR] VL53L1X not detected at 0x%02X -- check wiring "
-        "(SDA=GPIO%u/D%u, SCL=GPIO%u/D%u, VIN=3V3).\n",
-        VL53L1X_I2C_ADDR, I2C_SDA_PIN, I2C_SDA_PIN, I2C_SCL_PIN, I2C_SCL_PIN);
-  }
-#endif
-
-  // If not a single enabled sensor came up, scan the bus so the log is
+  // If not a single enabled I2C sensor came up, scan the bus so the log is
   // actionable. We do NOT hard-stop: loop() keeps reporting the error.
   if (!any_sensor_ok) {
     diagnoseEmptyBus();
-    Serial.println("[FATAL] No enabled sensor initialised. Fix wiring, reset.");
+    Serial.println("[FATAL] No enabled I2C sensor initialised. Fix wiring, reset.");
   } else {
-    Serial.println("[SENSOR] Init complete.");
+    Serial.println("[SENSOR] I2C init complete.");
   }
+#endif  // I2C_ENABLED
 
+#if ENABLE_GPS
+  Serial.printf("[GPS] UART2 RX=GPIO%u (RX2) TX=GPIO%u (TX2) @%lu baud\n",
+                GPS_RX_PIN, GPS_TX_PIN, (unsigned long)GPS_BAUD);
+  g_gps_ok = g_gps.begin(Serial2, GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD);
+  if (g_gps_ok) {
+    Serial.println("[GPS] Module is talking (valid NMEA sentence seen).");
+  } else {
+    Serial.println(
+        "[ERROR] GPS: no valid NMEA sentence in 3s -- check wiring (GPS TX -> "
+        "ESP32 GPIO16/RX2, GPS RX -> ESP32 GPIO17/TX2 -- easy to swap, "
+        "VCC=3V3, GND), that GPS_BAUD in config.h matches the module, and "
+        "that its LED is blinking (has power).");
+  }
+#endif
+
+#if ENABLE_MQ2
+  g_mq2.begin(MQ2_ANALOG_PIN, MQ2_DIGITAL_PIN);
+  Serial.printf(
+      "[MQ2] AO=GPIO%u DO=GPIO%u -- uncalibrated bring-up, warming up %lus "
+      "(readings before that are unreliable)\n",
+      MQ2_ANALOG_PIN, MQ2_DIGITAL_PIN, (unsigned long)(MQ2_WARMUP_MS / 1000));
+#endif
+
+#if ENABLE_DS18B20
+  g_ds18b20_ok = g_ds18b20.begin(DS18B20_PIN);
+  if (g_ds18b20_ok) {
+    Serial.printf("[DS18B20] Detected on GPIO%u (D%u)\n", DS18B20_PIN, DS18B20_PIN);
+  } else {
+    Serial.printf(
+        "[ERROR] DS18B20 not detected on GPIO%u (D%u) -- check wiring "
+        "(DATA=GPIO%u, VCC=3V3, GND) and that a 4.7k ohm pull-up resistor is "
+        "present between DATA and VCC (required unless your breakout "
+        "already includes one -- without it the bus floats and nothing "
+        "will be found even if wiring is otherwise correct).\n",
+        DS18B20_PIN, DS18B20_PIN, DS18B20_PIN);
+  }
+#endif
+
+#if SENSORS_ENABLED
   Serial.printf("[READY] sampling every %lu ms\n",
                 (unsigned long)SENSOR_INTERVAL_MS);
   g_last_sample_ms = millis() - SENSOR_INTERVAL_MS;  // force first sample now
-#endif  // I2C_ENABLED
+#endif
 
 #if ENABLE_LORA
   Serial.printf(
@@ -345,6 +446,12 @@ void setup() {
         "\"synth=1\", NOT real measurements. Disable ENABLE_SYNTHETIC_DATA "
         "in config.h once real sensors feed the packet.");
   }
+#else
+  if (LORA_ROLE_SENDER) {
+    Serial.println(
+        "[LoRa] TX payload source: REAL sensor readings (whichever of "
+        "MPU6050/GPS/MQ2 are enabled and reporting).");
+  }
 #endif
 
 #if ENABLE_WIFI_FORWARD
@@ -373,7 +480,20 @@ void loop() {
   serviceLoRa();
 #endif
 
-#if I2C_ENABLED
+#if ENABLE_GPS
+  // GPS bytes stream in continuously and must be drained every iteration --
+  // not just on the sample interval below -- or the UART buffer overflows
+  // and sentences get corrupted.
+  g_gps.poll();
+#endif
+
+#if ENABLE_DS18B20
+  // Advances the non-blocking conversion state machine every iteration so a
+  // ~750ms conversion never stalls the rest of loop() (GPS polling, LoRa).
+  g_ds18b20.update();
+#endif
+
+#if SENSORS_ENABLED
   const uint32_t now = millis();
   if ((now - g_last_sample_ms) >= SENSOR_INTERVAL_MS) {
     g_last_sample_ms = now;
@@ -388,30 +508,78 @@ void loop() {
       MpuReading r;
       if (g_mpu.read(r) && r.valid) {
         printMpu(r);
+#if ENABLE_LORA
+        g_last_mpu = r;
+        g_last_mpu_valid = true;
+#endif
       } else {
         Serial.println("[ERROR] MPU6050 read failed (I2C). Check wiring/power.");
+#if ENABLE_LORA
+        g_last_mpu_valid = false;  // don't let LoRa send a stale reading
+#endif
       }
     } else {
       Serial.println("[ERROR] MPU6050 not detected -- check wiring / config.h.");
+#if ENABLE_LORA
+      g_last_mpu_valid = false;
+#endif
     }
 #endif
 
-#if ENABLE_VL53L1X
-    if (g_tof_ok) {
-      TofReading r;
-      if (!g_tof.read(r)) {
-        Serial.println("[ERROR] VL53L1X read timeout (I2C). Check wiring/power.");
-      } else if (!r.valid) {
+#if ENABLE_GPS
+    if (g_gps_ok) {
+      GpsReading r;
+      g_gps.read(r);
+#if ENABLE_LORA
+      g_last_gps = r;
+#endif
+      if (r.has_fix) {
         Serial.printf(
-            "[VL53L1X] rejected reading: status=%u (%s)  raw_distance=%umm\n",
-            r.range_status, r.status_text, r.distance_mm);
+            "[GPS] fix lat=%.6f lon=%.6f alt=%.1fm sats=%u hdop=%.1f\n",
+            r.latitude_deg, r.longitude_deg, r.altitude_m, r.satellites,
+            r.hdop);
       } else {
-        printTof(r);
+        Serial.printf(
+            "[GPS] no fix yet (sentences_ok=%lu sentences_failed=%lu) -- "
+            "normal for the first 30s-few min outdoors; may never fix "
+            "indoors\n",
+            (unsigned long)r.sentences_ok, (unsigned long)r.sentences_failed);
       }
     } else {
-      Serial.println("[ERROR] VL53L1X not detected -- check wiring / power.");
+      Serial.println("[ERROR] GPS not talking -- check wiring / config.h.");
+    }
+#endif
+
+#if ENABLE_MQ2
+    {
+      Mq2Reading r;
+      g_mq2.read(r);
+#if ENABLE_LORA
+      g_last_mq2 = r;
+#endif
+      const bool warmed_up = millis() >= MQ2_WARMUP_MS;
+      Serial.printf(
+          "[MQ2] analog_raw=%u (%.2fV)  digital_pin_high=%s%s\n",
+          r.analog_raw, r.analog_volts, r.digital_pin_high ? "true" : "false",
+          warmed_up ? "" : "  (WARMING UP, ignore)");
+    }
+#endif
+
+#if ENABLE_DS18B20
+    if (g_ds18b20_ok) {
+      Ds18b20Reading r;
+      g_ds18b20.read(r);
+      if (r.valid) {
+        Serial.printf("[DS18B20] temp=%.2f C\n", r.temperature_c);
+      } else {
+        Serial.println(
+            "[ERROR] DS18B20 read failed -- disconnected mid-run? "
+            "Check wiring/pull-up.");
+      }
+    } else {
+      Serial.println("[ERROR] DS18B20 not detected -- check wiring / config.h.");
     }
 #endif
   }
-#endif  // I2C_ENABLED
+#endif  // SENSORS_ENABLED
 }

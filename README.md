@@ -25,18 +25,27 @@ team's responsibility and is not built here.
 ## Current status: bring-up of individual subsystems
 
 Each subsystem is brought up on its own, selected at build time by
-`ENABLE_MPU6050` / `ENABLE_VL53L1X` / `ENABLE_LORA` in `firmware/src/config.h`,
-printing to the Serial Monitor and failing loudly when hardware is missing:
+`ENABLE_MPU6050` / `ENABLE_GPS` / `ENABLE_MQ2` / `ENABLE_DS18B20` /
+`ENABLE_LORA` in `firmware/src/config.h`, printing to the Serial Monitor and
+failing loudly when hardware is missing:
 
-- **Phase 1 — MPU6050:** accel + gyro, derived roll/pitch. *(hardware not yet
-  detected on the bench — under debugging)*
-- **Phase 2 — VL53L1X:** distance in mm, with invalid-reading rejection.
-  *(hardware not yet detected — under debugging)*
-- **Phase 8 — LoRa Ra-02:** SPI init + version check, transmit-test / receive
-  roles (`LORA_ROLE_SENDER`). Independent of the I2C bus.
+- **MPU6050 (I2C):** accel + gyro, derived roll/pitch. Confirmed working —
+  the GY-521 breakout carries an MPU6500 die (WHO_AM_I `0x70`, not the genuine
+  MPU6050's `0x68`), a common clone substitution; the driver talks raw I2C
+  registers and accepts either chip ID.
+- **GPS (UART2):** NEO-6M/M8N-style module, NMEA parsed via TinyGPSPlus.
+  Bring-up only — reports fix/lat/lon/sats or "no fix yet" diagnostics.
+- **MQ-2 (analog + digital):** methane/smoke sensor, deliberately
+  uncalibrated bring-up (raw ADC + digital pin state only — no ppm
+  conversion, no safe/danger threshold; see `lib/MQ2Sensor`).
+- **DS18B20 (1-Wire):** temperature, via OneWire + DallasTemperature.
+  Non-blocking conversion cycle (~750ms) so it never stalls the rest of the
+  loop; needs an external 4.7kΩ pull-up resistor (see `docs/wiring.md`).
+- **LoRa Ra-02 (SPI):** init + version check, transmit-test / receive roles
+  (`LORA_ROLE_SENDER`).
 
-Phase 3 = both sensors enabled at once. LoRa can run alongside the sensors or
-on its own.
+All five buses are independent — enable any subset. The VL53L1X ToF sensor
+was removed from the project scope and replaced by GPS + MQ-2 (+ DS18B20).
 
 Not yet implemented: calibration/baseline/delta, filtering, configurable JSON
 packets, Wi-Fi, Raspberry Pi gateway.
@@ -50,8 +59,10 @@ firmware/
     main.cpp                  setup/loop orchestration only
     config.h                  THE config file: node ID, pins, timing, baud
   lib/
-    MPU6050Sensor/            self-contained MPU6050 wrapper module
-    VL53L1XSensor/            self-contained VL53L1X wrapper module
+    MPU6050Sensor/            self-contained MPU6050/6500 wrapper module
+    GPSModule/                self-contained NEO-6M/M8N GPS wrapper module
+    MQ2Sensor/                self-contained MQ-2 gas/smoke wrapper module
+    DS18B20Sensor/            self-contained DS18B20 temperature wrapper module
     LoRaTransport/            self-contained Ra-02 / SX1278 wrapper module
 docs/
   wiring.md                   pin tables (GPIO + board silkscreen labels)

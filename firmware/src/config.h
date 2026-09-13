@@ -20,11 +20,11 @@
 // ---------------------------------------------------------------------------
 // Change this per physical node: "NODE_01", "NODE_02", ...
 // Nothing else in the codebase should hard-code a node name.
-#define NODE_ID "NODE_02"
+#define NODE_ID "NODE_01"
 
 // Firmware phase label, printed at boot so we can tell units apart on the
 // bench. Purely cosmetic -- update it as the enabled feature set changes.
-#define FIRMWARE_PHASE "Phase 8 (LoRa link, synthetic data)"
+#define FIRMWARE_PHASE "Phase 8 (LoRa receiver)"
 
 // ---------------------------------------------------------------------------
 // Serial
@@ -34,24 +34,32 @@ static const uint32_t SERIAL_BAUD = 115200;
 
 // ---------------------------------------------------------------------------
 // Which features this build enables. Bring one subsystem up at a time.
-//   Phase 1  MPU6050 only   ->  ENABLE_MPU6050 1
-//   Phase 2  VL53L1X only   ->  ENABLE_VL53L1X 1
-//   Phase 3  both sensors   ->  ENABLE_MPU6050 1 , ENABLE_VL53L1X 1
-//   Phase 8  LoRa link      ->  ENABLE_LORA 1 (sensors optional)
-// I2C is only touched when a sensor is enabled; LoRa is on SPI, independent.
-// (Currently set for Phase 8 LoRa bring-up.)
+//   MPU6050 (I2C)          ->  ENABLE_MPU6050 1
+//   GPS (UART2)            ->  ENABLE_GPS 1
+//   MQ-2 (analog+digital)  ->  ENABLE_MQ2 1
+//   DS18B20 (1-Wire)       ->  ENABLE_DS18B20 1
+//   LoRa link (SPI)        ->  ENABLE_LORA 1 (sensors optional)
+// Each bus is independent -- I2C only touched if ENABLE_MPU6050, UART2 only
+// if ENABLE_GPS, LoRa's SPI only if ENABLE_LORA. Mix and match freely.
+// (VL53L1X / ToF sensor was removed from the project -- no longer used.)
+// (Currently set to bring up MPU6050 + GPS + MQ-2 together. LoRa left off --
+// enable it separately once these three are confirmed on the bench.)
 // ---------------------------------------------------------------------------
 #define ENABLE_MPU6050  0
-#define ENABLE_VL53L1X  0
+#define ENABLE_GPS      0
+#define ENABLE_MQ2      0
+#define ENABLE_DS18B20  0
 #define ENABLE_LORA     1
 
 // ---------------------------------------------------------------------------
-// I2C bus  (shared in later phases by MPU6050 + VL53L1X)
+// I2C bus  (MPU6050)
 // ---------------------------------------------------------------------------
 static const uint8_t  I2C_SDA_PIN  = 21;      // board label "D21"
 static const uint8_t  I2C_SCL_PIN  = 22;      // board label "D22"
-static const uint32_t I2C_CLOCK_HZ = 400000;  // 400 kHz "fast mode"; drop to
-                                              // 100000 if wiring is long/noisy.
+static const uint32_t I2C_CLOCK_HZ = 100000;  // 100 kHz "standard mode" --
+                                              // dropped from 400 kHz to test
+                                              // whether the MPU6050 timeout
+                                              // is a bus-timing margin issue.
 
 // MPU6050 7-bit I2C address.
 //   AD0 pin low  (GY-521 default) -> 0x68
@@ -59,34 +67,48 @@ static const uint32_t I2C_CLOCK_HZ = 400000;  // 400 kHz "fast mode"; drop to
 static const uint8_t MPU6050_I2C_ADDR = 0x68;
 
 // ---------------------------------------------------------------------------
-// VL53L1X Time-of-Flight distance sensor (shares the I2C bus above)
+// GPS module (NEO-6M / NEO-M8N style) -- plain NMEA over the ESP32's second
+// hardware UART. Wiring: GPS TX -> GPS_RX_PIN, GPS RX -> GPS_TX_PIN (only
+// needed to send commands to the module), VCC -> 3V3 (confirm your specific
+// module tolerates 3.3V; most NEO-6M/M8N breakouts do), GND -> GND.
 // ---------------------------------------------------------------------------
-// Fixed 7-bit address for the VL53L1X. It differs from the MPU6050's, so both
-// devices can sit on the same bus without changing anything.
-static const uint8_t VL53L1X_I2C_ADDR = 0x29;
+static const uint8_t  GPS_RX_PIN = 16;    // board label "RX2" -- ESP32 receives here
+static const uint8_t  GPS_TX_PIN = 17;    // board label "TX2" -- ESP32 transmits here
+static const uint32_t GPS_BAUD   = 9600;  // NEO-6M/M8N power-on default
 
-// Distance mode:
-//   true  -> Long  (~4 m range, more sensitive to ambient light)
-//   false -> Short (~1.3 m range, best immunity to ambient light / sunlight)
-// For a fixed indoor reference target under ~1 m, Short is usually steadier.
-static const bool VL53L1X_LONG_RANGE = true;
+// ---------------------------------------------------------------------------
+// MQ-2 gas/smoke sensor (methane + smoke, bring-up/testing only -- see
+// lib/MQ2Sensor for why this is deliberately uncalibrated).
+//
+// Wiring: VCC -> 3V3 (NOT 5V/VIN -- at 5V the AO/DO outputs can approach the
+// supply rail, above the ESP32's 3.3V max input, and could damage the pins).
+// GND -> GND. Running the heater at 3.3V instead of the datasheet 5V means
+// readings are qualitative (rise/fall with gas) only, not calibrated ppm.
+// ---------------------------------------------------------------------------
+static const uint8_t MQ2_ANALOG_PIN  = 34;  // board label "D34", ADC1_CH6
+static const uint8_t MQ2_DIGITAL_PIN = 35;  // board label "D35", ADC1_CH7
 
-// Measurement timing budget, microseconds. Longer budget = less noise, slower
-// updates. 50 ms is a solid general-purpose value.
-static const uint32_t VL53L1X_TIMING_BUDGET_US = 50000;
+// Heater warm-up time before readings are meaningful. This is a bring-up
+// minimum, not a calibration soak -- the datasheet recommends much longer
+// (hours) for readings to match its ppm curves.
+static const uint32_t MQ2_WARMUP_MS = 60000;
 
-// Inter-measurement period for continuous ranging, milliseconds.
-// Must be >= timing budget (in ms). 50 pairs with the 50 ms budget above.
-static const uint32_t VL53L1X_INTERMEASUREMENT_MS = 50;
-
-// I2C read timeout for the ToF sensor, milliseconds. A read that exceeds this
-// is reported as a timeout error instead of hanging.
-static const uint16_t VL53L1X_IO_TIMEOUT_MS = 500;
+// ---------------------------------------------------------------------------
+// DS18B20 temperature sensor -- 1-Wire digital sensor, ambient/ground
+// temperature alongside the other measurements.
+//
+// Wiring: DATA -> DS18B20_PIN, VCC -> 3V3, GND -> GND. REQUIRES a 4.7k ohm
+// pull-up resistor between DATA and VCC -- a bare TO-92 sensor does not have
+// one built in (some waterproof-probe breakout boards do; check yours).
+// Without the pull-up the bus floats and no device will be found, even with
+// wiring otherwise correct.
+// ---------------------------------------------------------------------------
+static const uint8_t DS18B20_PIN = 4;  // board label "D4"
 
 // ---------------------------------------------------------------------------
 // Sampling
 // ---------------------------------------------------------------------------
-// How often loop() reads the sensors and prints a block. Tune later to match
+// How often loop() reads the sensor and prints a block. Tune later to match
 // the physical experiment. Do not hard-code this interval elsewhere.
 static const uint32_t SENSOR_INTERVAL_MS = 1000;
 
@@ -126,12 +148,12 @@ static const int  LORA_TX_POWER_DBM        = 17;       // 2..20 via the Ra-02 PA
 // How often the sender transmits a test packet.
 static const uint32_t LORA_TX_INTERVAL_MS = 2000;
 
-// While the real MPU6050 / VL53L1X are being replaced, the SENDER can transmit
+// While the real MPU6050 is being brought up, the SENDER can transmit
 // fabricated readings so the node <-> node link is exercised end to end with
 // data-shaped payloads instead of a bare counter. Every synthetic payload
 // carries "synth=1"; nothing downstream may treat it as a real measurement.
 // Requires ENABLE_LORA. Set back to 0 once real sensor data feeds the packet.
-#define ENABLE_SYNTHETIC_DATA 1
+#define ENABLE_SYNTHETIC_DATA 0
 
 // ---------------------------------------------------------------------------
 // Wi-Fi forwarding (RECEIVER board only)
@@ -144,7 +166,7 @@ static const uint32_t LORA_TX_INTERVAL_MS = 2000;
 // Requires firmware/src/secrets.h with WIFI_SSID / WIFI_PASSWORD -- copy
 // secrets.h.example and fill in your real network. secrets.h is git-ignored;
 // never commit real credentials.
-#define ENABLE_WIFI_FORWARD 1
+#define ENABLE_WIFI_FORWARD 0
 
 // LAN IP (or hostname) and port of the laptop running wifi_listener.py.
 // Find the laptop's IP with `ipconfig getifaddr en0` (macOS Wi-Fi),

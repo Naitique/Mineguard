@@ -43,30 +43,51 @@ When adding a knob, it goes here.
 scheduling, per-sensor init/status reporting, and serial formatting. It must not
 contain sensor register logic — that lives in the per-sensor modules.
 
-**`firmware/lib/<Name>Sensor/` — one self-contained module per sensor.** Each
-wraps a vendor library and exposes the same shape:
-- `begin(TwoWire&, ...)` → `bool` (false = device absent/miswired)
-- `read(<Name>Reading& out)` → `bool`
+**`firmware/lib/<Name>/` — one self-contained module per subsystem.** Sensor
+modules expose the same shape:
+- `begin(...)` → `bool` where a presence check is possible (false = device
+  absent/miswired); MQ2Sensor has no handshake to check, so its `begin()`
+  returns `void`.
+- `read(<Name>Reading& out)` → `bool` (or `void` for MQ2Sensor, GPSModule,
+  DS18B20Sensor — none of these can "fail" a read, only report a snapshot).
 - a plain-struct `<Name>Reading` that carries **both raw and derived values**
-  (e.g. raw accel/gyro *and* roll/pitch; raw distance *and* status code). Raw
+  where that distinction exists (e.g. raw accel/gyro *and* roll/pitch). Raw
   measurements are never discarded — the AI team may need the raw time series.
-- Current modules: `MPU6050Sensor` (wraps `adafruit/Adafruit MPU6050`; roll/pitch
-  computed here with `atan2`, **not** the on-chip DMP) and `VL53L1XSensor` (wraps
-  `pololu/VL53L1X`; continuous ranging; only range_status `RangeValid` / `6` count
-  as usable, everything else is a *reported* rejected reading).
+- Current modules:
+  - `MPU6050Sensor` — talks raw I2C registers directly, no vendor library —
+    accepts WHO_AM_I `0x68` genuine MPU6050 *or* `0x70` MPU6500, since cheap
+    GY-521 breakouts often ship the latter and Adafruit's driver hard-rejects
+    it; roll/pitch computed here with `atan2`, **not** the on-chip DMP.
+  - `GPSModule` — wraps `mikalhart/TinyGPSPlus` over the ESP32's UART2
+    (`Serial2`); no address/ID handshake exists on a bare UART, and "did any
+    byte arrive" is NOT a safe presence check -- a floating RX pin generates
+    noise the UART reports as real bytes, confirmed on the bench. `begin()`
+    instead requires `passedChecksum() > 0` within a 3s window (a fully
+    checksum-valid NMEA sentence assembled -- noise can't fake that).
+  - `MQ2Sensor` — plain `analogRead()`/`digitalRead()`, no library. Runs the
+    heater at 3V3 (not the datasheet 5V) so the AO/DO outputs can never exceed
+    the ESP32's 3.3V max input; readings are therefore uncalibrated (no ppm
+    conversion, no safe/danger threshold — that classification is out of
+    scope here regardless of calibration).
+  - `DS18B20Sensor` — wraps `paulstoffregen/OneWire` + `milesburton/DallasTemperature`.
+    Conversion takes ~750ms; rather than block, `update()` runs a non-blocking
+    request/wait/read state machine (call every `loop()` iteration, like
+    `GPSModule::poll()`) and `read()` returns the latest cached result instantly.
+  (The VL53L1X ToF sensor was removed from the project — replaced by GPS + MQ-2 + DS18B20.)
 
-**`ENABLE_MPU6050` / `ENABLE_VL53L1X` in `config.h` are compile switches that map
-to the development phases:** `1/0` = Phase 1 (MPU only), `0/1` = Phase 2 (ToF
-only), `1/1` = Phase 3 (both on the shared I2C bus). `main.cpp` guards init and
-loop bodies per flag with `#if`, and a compile `#error` fires if both are off.
-`FIRMWARE_PHASE` in `config.h` is a cosmetic boot-banner label — update it when
-the enabled set changes.
+**`ENABLE_MPU6050` / `ENABLE_GPS` / `ENABLE_MQ2` / `ENABLE_DS18B20` /
+`ENABLE_LORA` in `config.h` are independent compile switches**, one per bus
+(I2C / UART2 / analog+digital / 1-Wire / SPI) — `main.cpp` guards init and
+loop bodies per flag with `#if`; a compile `#error` fires if nothing is
+enabled. `FIRMWARE_PHASE` in `config.h` is a cosmetic boot-banner label —
+update it when the enabled set changes.
 
-**Error-handling philosophy:** never silently continue as if a missing sensor is
+**Error-handling philosophy:** never silently continue as if missing hardware is
 fine. Every failure path prints a `[ERROR]`/`[FATAL]` line to serial. If no
-enabled sensor initializes, `diagnoseEmptyBus()` scans 0x08–0x77, retries once at
-100 kHz, and prints a wiring checklist. Serial line prefixes in use: `[BOOT]`
-`[I2C]` `[MPU6050]` `[VL53L1X]` `[DATA]` `[READY]` `[SENSOR]` `[ERROR]` `[FATAL]`.
+enabled I2C sensor initializes, `diagnoseEmptyBus()` scans 0x08–0x77, retries
+once at 100 kHz, and prints a wiring checklist. Serial line prefixes in use:
+`[BOOT]` `[I2C]` `[MPU6050]` `[GPS]` `[MQ2]` `[DS18B20]` `[LoRa]` `[DATA]`
+`[READY]` `[SENSOR]` `[ERROR]` `[FATAL]`.
 
 ## Hardware pin map
 
@@ -74,10 +95,17 @@ Board is a 30-pin ESP32-WROOM-32 dev board (DOIT DevKit V1 style). **Firmware us
 GPIO numbers; comments give the board silkscreen label** (e.g. GPIO 21 = "D21").
 `docs/wiring.md` has the full pin tables with per-pin notes.
 
-- I2C (MPU6050 + VL53L1X share it): SDA = GPIO 21 (D21), SCL = GPIO 22 (D22).
-  MPU6050 at 0x68 (0x69 if AD0 high), VL53L1X at 0x29.
-- LoRa Ra-02 SX1278 on VSPI (Phase 8, not yet wired in firmware): SCK 18, MISO 19,
-  MOSI 23, NSS 5, RST 14, DIO0 26.
+- I2C (MPU6050): SDA = GPIO 21 (D21), SCL = GPIO 22 (D22). Chip at 0x68
+  (genuine MPU6050) or 0x70 (MPU6500 clone); 0x69 if AD0 is tied high.
+- UART2 (GPS): RX = GPIO 16 ("RX2"), TX = GPIO 17 ("TX2"), 9600 baud default.
+- MQ-2 (analog+digital): AO = GPIO 34 (D34, ADC1_CH6), DO = GPIO 35 (D35,
+  ADC1_CH7) — both ADC1 (safe if Wi-Fi is later enabled) and input-only.
+  VCC = 3V3 only, never 5V/VIN (see lib/MQ2Sensor for why).
+- DS18B20 (1-Wire): DATA = GPIO 4 (D4), a plain non-strapping pin. Needs an
+  external 4.7kΩ pull-up between DATA and VCC -- most bare sensors don't
+  include one.
+- LoRa Ra-02 SX1278 on VSPI (Phase 8): SCK 18, MISO 19, MOSI 23, NSS 5, RST 14,
+  DIO0 26.
 - All peripherals run from the ESP32 3V3 rail; all grounds common.
 
 ## Development process
@@ -100,10 +128,10 @@ tracked source.
 ## Data model
 
 The canonical sensor-packet JSON schema (node_id, timestamp, `mpu6050{}`,
-`vl53l1x{}`, `status{}`) is specified in the project brief and materializes in
-Phase 5. Distinguish device uptime (`millis()`) from a synchronized timestamp
-(NTP, when Wi-Fi is available) — the current firmware only has uptime and labels
-it as such.
+`status{}`) is specified in the project brief and materializes in Phase 5.
+Distinguish device uptime (`millis()`) from a synchronized timestamp (NTP, when
+Wi-Fi is available) — the current firmware only has uptime and labels it as
+such.
 
 ## Note
 

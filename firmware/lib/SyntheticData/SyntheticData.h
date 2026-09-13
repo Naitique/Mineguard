@@ -1,6 +1,6 @@
 // ===========================================================================
 // SyntheticData  --  fabricated sensor readings for exercising the node <->
-// node LoRa link while the real MPU6050 / VL53L1X hardware is being replaced.
+// node LoRa link while the real MPU6050 hardware is being brought up.
 //
 // This is TEMPORARY bench scaffolding, NOT part of the measurement chain:
 //   * every value here is made up (slow sine waves + random noise);
@@ -20,12 +20,10 @@
 
 struct SyntheticReading {
   // Only the fields formatSyntheticPayload() (main.cpp) actually puts on the
-  // wire. Not a full mirror of MpuReading/TofReading -- add fields here only
-  // when something reads them.
-  float    accel_z_g   = 1.0f;
-  float    gyro_z_dps  = 0.0f;
-  uint16_t dist_mm     = 0;
-  uint8_t  range_status = 0;   // 0 == "RangeValid", matching VL53L1XSensor
+  // wire. Not a full mirror of MpuReading -- add fields here only when
+  // something reads them.
+  float accel_z_g  = 1.0f;
+  float gyro_z_dps = 0.0f;
 
   // derived values
   float roll_deg  = 0.0f;

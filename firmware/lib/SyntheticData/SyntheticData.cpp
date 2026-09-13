@@ -30,10 +30,4 @@ void SyntheticData::read(SyntheticReading& out) {
 
   // Gyroscope Z: essentially at rest.
   out.gyro_z_dps = noise(0.3f);
-
-  // Time-of-flight: ~1500 mm reference target, a few mm of slow movement.
-  const float dist =
-      1500.0f - 4.0f * sinf(t * (2.0f * PI / 120.0f)) + noise(2.0f);
-  out.dist_mm      = static_cast<uint16_t>(lroundf(dist));
-  out.range_status = 0;  // always a valid range for the demo
 }
